@@ -1,0 +1,124 @@
+# [[filters]]
+# name = "Move emails from specific sender"
+# enabled = true
+# priority = 1
+
+#   [filters.condition]
+#   type = "from"
+#   value = "sender@example.com"
+
+#   [filters.action]
+#   type = "move"
+#   folder = "Folder A"
+
+# [[filters]]
+# name = "Delete emails with specific subject"
+# enabled = true
+# priority = 2
+
+#   [filters.condition]
+#   type = "subject_contains"
+#   value = "urgent sale"
+
+#   [filters.action]
+#   type = "delete"
+
+# [[filters]]
+# name = "Test filters"
+# enabled = true
+# priority = 1
+
+#   [filters.condition]
+#   type = "subject_is"
+#   value = "test"
+
+#   [filters.action]
+#   type = "move_to_folder"
+#   folder = "Junk"
+
+# [[filters]]
+# name = "Mark as read and move"
+# enabled = true
+# priority = 4
+
+#   [filters.condition]
+#   type = "subject_contains"
+#   value = "automated report"
+
+#   [filters.action]
+#   type = "multiple"
+#   actions = ["mark_read", "move"]
+#   folder = "Reports"
+
+[[filters]]
+name = "Junk"
+enabled = true
+priority = 5
+
+  [filters.condition]
+  type = "or"
+  conditions = [
+    { type = "from_contains", value = "gamedev.tv" },
+    { type = "from_contains", value = "daily.dev" },
+    { type = "from_contains", value = "airbaltic" },
+    { type = "from_contains", value = "linkedin" },
+    { type = "from_contains", value = "beehiiv" },
+    { type = "from_contains", value = "unity3d" },
+    { type = "from_contains", value = "elegoo" },
+    { type = "from_contains", value = "newsletter@reply.hashicorp.com" },
+    { type = "subject_contains", value = "eToro Daily Bites" },
+    { type = "subject_contains", value = "ML Mastery" }
+  ]
+
+  [filters.action]
+  type = "move_to_folder"
+  folder = "Junk"
+  # type = "multiple"
+  # actions = ["mark_read", "move"]
+  # folder = "Junk"
+
+[[filters]]
+name = "Game deals"
+enabled = true
+priority = 5
+
+    [filters.condition]
+    type = "or"
+    conditions = [
+      { type = "from_contains", value = "humblebundle" },
+      { type = "from_contains", value = "steam" },
+      { type = "from_contains", value = "gog" },
+      { type = "from_contains", value = "prosperousuniverse" },
+      { type = "from_contains", value = "instant-gaming" },
+      { type = "from_contains", value = "eneba" },
+      { type = "from_contains", value = "cdkeys" },
+    ]
+
+    [filters.action]
+    type = "move_to_folder"
+    folder = "Game Deals"
+    # type = "multiple"
+    # actions = ["mark_read", "move"]
+    # folder = "Game Deals"
+
+[[filters]]
+name = "J*b Applications"
+enabled = true
+priority = 5
+
+      [filters.condition]
+      type = "or"
+      conditions = [
+        { type = "from_contains", value = "cv.lv" },
+        { type = "from_contains", value = "sage.hr" },
+        { type = "from_contains", value = "sapiensprd-jobnotification@noreply12.jobs2web.com" },
+        { type = "from_contains", value = "teamtailor" },
+        { type = "from_contains", value = "linkedin" },
+      ]
+
+      [filters.action]
+      type = "move_to_folder"
+      folder = "J*b Applications"
+      # type = "multiple"
+      # actions = ["mark_read", "move"]
+      # folder = "J*b Applications"

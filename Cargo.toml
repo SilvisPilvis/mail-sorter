@@ -1,0 +1,28 @@
+[package]
+name = "mail-sorter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies.imap]
+version = "2.4.1"
+
+[dependencies.native-tls]
+version = "0.2.14"
+
+[dependencies.chrono]
+version = "*"
+
+[dependencies.base64]
+version = "0.22.1"
+
+
+
+[dependencies.mailparse]
+version = "*"
+
+[dependencies.serde]
+version = "*"
+features = ["derive"]
+
+[dependencies.toml]
+version = "*"
