@@ -1,12 +1,16 @@
 use mailparse::{self, MailHeaderMap};
-use native_tls;
 use serde::{Deserialize, Serialize};
 use toml;
 
+use async_imap::extensions::idle::IdleResponse;
+use async_imap::{Authenticator, Client, Session};
 use chrono::{DateTime, Utc};
-use imap::Session;
-use native_tls::TlsStream;
-use std::net::TcpStream;
+use dotenvy::dotenv;
+use futures::TryStreamExt;
+use native_tls::TlsConnector as NativeTlsConnector;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio_native_tls::{TlsConnector, TlsStream};
 
 fn log_func(args: std::fmt::Arguments) {
     let offset = chrono::FixedOffset::east_opt(3600 * 2).unwrap();
@@ -67,10 +71,11 @@ struct GmailOAuth2 {
     access_token: String,
 }
 
-impl imap::Authenticator for GmailOAuth2 {
+type ImapSession = Session<TlsStream<TcpStream>>;
+
+impl Authenticator for GmailOAuth2 {
     type Response = String;
-    #[allow(unused_variables)]
-    fn process(&self, data: &[u8]) -> Self::Response {
+    fn process(&mut self, _: &[u8]) -> Self::Response {
         format!(
             "user={}\x01auth=Bearer {}\x01\x01",
             self.user, self.access_token
@@ -78,62 +83,90 @@ impl imap::Authenticator for GmailOAuth2 {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn connect_and_authenticate(
+    auth: GmailOAuth2,
+) -> Result<ImapSession, Box<dyn std::error::Error + Send + Sync>> {
     let domain = "imap.gmail.com";
+    let port = 993;
+
+    let native_tls_connector = NativeTlsConnector::builder().build()?;
+    let tls_connector = TlsConnector::from(native_tls_connector);
+
+    let tcp_stream = TcpStream::connect((domain, port)).await?;
+    let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
+
+    let mut client = Client::new(tls_stream);
+    let greeting = client.read_response().await?;
+    if greeting.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Expected IMAP greeting",
+        )
+        .into());
+    }
+
+    let session = client
+        .authenticate("LOGIN", auth)
+        .await
+        .map_err(|(err, _client)| err)?;
+
+    Ok(session)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    load_dotenv()?;
+
     let config_path = std::path::PathBuf::from("config.toml");
 
     let args: Vec<String> = std::env::args().collect();
 
     // Check if an argument exists to avoid a panic if the user runs it without args
     if args.len() < 2 {
-        eprintln!("Usage: <program> [monitor|filter]");
-        return Err("Incorrect arguments".into());
+        eprintln!("Usage: <program> [monitor|filter] (requires GMAIL_USER and GMAIL_ACCESS_TOKEN)");
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Incorrect arguments").into(),
+        );
     }
 
-    // Load config
-    let config: Config = toml::from_str(&std::fs::read_to_string(config_path)?)?;
-    log!("Loaded {} filters from config", config.filters.len());
-
-    // Connect to IMAP
     let gmail_auth = GmailOAuth2 {
-        user: String::from("silvestrsl47@gmail.com"),
-        access_token: String::from("yste jmmi nmga xxwg"),
+        user: std::env::var("GMAIL_USER")?,
+        access_token: std::env::var("GMAIL_ACCESS_TOKEN")?,
     };
 
-    let tls = native_tls::TlsConnector::builder().build()?;
-    let client = imap::connect((domain, 993), domain, &tls)?;
-    let mut session = client
-        .login(gmail_auth.user, gmail_auth.access_token)
-        .unwrap();
+    println!("Using user {}", gmail_auth.user);
+    println!("Using access token {}", gmail_auth.access_token);
+
+    let mut session = connect_and_authenticate(gmail_auth).await?;
+
+    // Load config
+    let email_config: Config = toml::from_str(&std::fs::read_to_string(config_path)?)?;
+    log!("Loaded {} filters from config", email_config.filters.len());
 
     // Select INBOX (read-write mode required for moving/deleting)
-    let mailbox = session.select("INBOX")?;
+    let mailbox = session.select("INBOX").await?;
     log!("Connected to INBOX with {} messages", mailbox.exists);
 
     match args[1].as_str() {
         "monitor" => {
             log!("Running in monitor mode.");
-            let err = monitor_inbox(&mut session, &config);
-            match err {
-                Ok(_) => {}
-                Err(e) => {
-                    eprint!("Error in monitor mode: {}", e);
-                }
+            let err = monitor_inbox(session, &email_config).await;
+            if let Err(e) = err {
+                eprint!("Error in monitor mode: {}", e);
             }
-            let _ = &session.logout()?;
         }
         "filter" => {
             log!("Running in filter mode.");
             // Fetch emails
-            let emails = fetch_emails_by_uid_batches(&mut session, "INBOX", 50)?;
+            let emails = fetch_emails_by_uid_batches(&mut session, "INBOX", 50).await?;
 
             // Process with filters
             if !emails.is_empty() {
-                process_emails_with_filters(&mut session, &emails, &config)?;
+                process_emails_with_filters(&mut session, &emails, &email_config).await?;
             }
             // Clean logout
             println!("\nMailbox filtered successfully");
-            session.logout()?;
+            session.logout().await?;
         }
         _ => eprint!("Unknown argument {}", args[1]),
     }
@@ -141,18 +174,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn fetch_latest_email(
-    session: &mut Session<TlsStream<TcpStream>>,
+fn load_dotenv() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if dotenv().is_ok() {
+        return Ok(());
+    }
+
+    let mut search_bases: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        search_bases.push(current_dir);
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            search_bases.push(exe_dir.to_path_buf());
+        }
+    }
+
+    for base in search_bases {
+        let mut cursor = base.as_path();
+        loop {
+            let candidate = cursor.join(".env");
+            if candidate.is_file() {
+                match dotenvy::from_path(&candidate) {
+                    Ok(_) => return Ok(()),
+                    Err(err) => {
+                        return Err(format!(
+                            "Failed to load .env file at {}: {}",
+                            candidate.display(),
+                            err
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            match cursor.parent() {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+    }
+
+    Err("Failed to load .env file".into())
+}
+
+async fn fetch_latest_email(
+    session: &mut ImapSession,
     mailbox_name: &str,
-) -> Result<Email, Box<dyn std::error::Error>> {
-    session.select(mailbox_name)?;
+) -> Result<Email, Box<dyn std::error::Error + Send + Sync>> {
+    session.select(mailbox_name).await?;
 
     // Get the highest UID (most recent email)
-    let uids = session.uid_search("ALL")?;
-    let latest_uid = uids.iter().max().ok_or("No messages in mailbox")?;
+    let uids = session.uid_search("ALL").await?;
+    let latest_uid = uids.iter().max().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "No messages in mailbox")
+    })?;
 
     // Fetch that specific email
-    let fetch_result = session.uid_fetch(format!("{}", latest_uid), "RFC822")?;
+    let fetch_result = session
+        .uid_fetch(format!("{}", latest_uid), "RFC822")
+        .await?;
+    let fetch_result: Vec<_> = fetch_result.try_collect().await?;
 
     // -- MOST OPTIMAL
     // Get highest sequence number (not UID) to fetch latest in one command
@@ -164,7 +247,9 @@ fn fetch_latest_email(
     // --
 
     // Fetch the latest email
-    let message = fetch_result.first().ok_or("No messages in mailbox")?;
+    let message = fetch_result.first().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "No messages in mailbox")
+    })?;
 
     let body_bytes = match message.body() {
         Some(b) => b,
@@ -173,7 +258,11 @@ fn fetch_latest_email(
                 "Skipping UID {}: No body content found",
                 message.uid.unwrap_or(0)
             );
-            return Err("No body content found".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "No body content found",
+            )
+            .into());
         }
     };
 
@@ -181,7 +270,11 @@ fn fetch_latest_email(
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to parse email: {}", e);
-            return Err("Failed to parse email".into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to parse email",
+            )
+            .into());
         }
     };
 
@@ -242,30 +335,34 @@ fn fetch_latest_email(
 }
 
 /// Monitors inbox for new messages using IMAP IDLE
-fn monitor_inbox(
-    session: &mut Session<TlsStream<TcpStream>>, // Change to &mut
-    config: &Config,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn monitor_inbox(
+    mut session: ImapSession,
+    email_config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log!("Using IDLE to monitor incoming emails in realtime.");
-    let mailbox = session.select("INBOX")?;
+    let mailbox = session.select("INBOX").await?;
 
     // Track the highest UID we've already processed
     let mut last_processed_uid = session
-        .uid_search("ALL")?
+        .uid_search("ALL")
+        .await?
         .iter()
         .max()
         .cloned()
         .unwrap_or(0);
 
     loop {
-        let mut idle = session.idle()?;
-        idle.set_keepalive(std::time::Duration::from_secs(60 * 10));
+        let mut idle = session.idle();
+        idle.init().await?;
+        let (wait, _stop) = idle.wait_with_timeout(Duration::from_secs(60 * 10));
+        let response = wait.await?;
+        session = idle.done().await?;
 
-        match idle.wait_keepalive() {
-            Ok(_) => {
-                log!("{} New emails recived.", mailbox.exists);
+        match response {
+            IdleResponse::NewData(_) | IdleResponse::Timeout | IdleResponse::ManualInterrupt => {
+                log!("{} New emails received.", mailbox.exists);
                 // Get current max UID
-                let current_uids = session.uid_search("ALL")?;
+                let current_uids = session.uid_search("ALL").await?;
                 let current_max_uid = current_uids.iter().max().cloned().unwrap_or(0);
 
                 // If there are new messages
@@ -278,36 +375,31 @@ fn monitor_inbox(
                     );
 
                     let new_emails = fetch_emails_by_uid_range(
-                        session,
+                        &mut session,
                         "INBOX",
                         last_processed_uid + 1,
                         current_max_uid,
-                    )?;
+                    )
+                    .await?;
 
                     // Process all new emails
-                    process_emails_with_filters(session, &new_emails, config)?;
+                    process_emails_with_filters(&mut session, &new_emails, email_config).await?;
 
                     // Update last processed UID
                     last_processed_uid = current_max_uid;
                 }
             }
-            Err(e) => {
-                // println!("Error waiting for IDLE: {}", e);
-                // log!("Error waiting for IDLE: {}", e);
-                // session.logout()?;
-                return Err(format!("Failed waiting for IDLE: {}", e).into());
-            }
         }
     }
 }
 
-fn fetch_emails_by_uid_range(
-    session: &mut Session<TlsStream<TcpStream>>,
+async fn fetch_emails_by_uid_range(
+    session: &mut ImapSession,
     mailbox: &str,
     start_uid: u32,
     end_uid: u32,
-) -> Result<Vec<Email>, Box<dyn std::error::Error>> {
-    session.select(mailbox)?;
+) -> Result<Vec<Email>, Box<dyn std::error::Error + Send + Sync>> {
+    session.select(mailbox).await?;
 
     // Validate range
     if start_uid > end_uid {
@@ -322,7 +414,8 @@ fn fetch_emails_by_uid_range(
     };
 
     // Fetch only the specified range
-    let messages = session.uid_fetch(uid_range, "BODY.PEEK[]")?;
+    let messages = session.uid_fetch(uid_range, "BODY.PEEK[]").await?;
+    let messages: Vec<_> = messages.try_collect().await?;
 
     let mut emails = Vec::new();
 
@@ -392,15 +485,15 @@ fn fetch_emails_by_uid_range(
 }
 
 // Example using UIDs instead of sequence numbers (more reliable)
-fn fetch_emails_by_uid_batches(
-    session: &mut Session<TlsStream<TcpStream>>,
+async fn fetch_emails_by_uid_batches(
+    session: &mut ImapSession,
     mailbox: &str,
     batch_size: u32,
-) -> Result<Vec<Email>, Box<dyn std::error::Error>> {
-    session.select(mailbox)?;
+) -> Result<Vec<Email>, Box<dyn std::error::Error + Send + Sync>> {
+    session.select(mailbox).await?;
 
     // Search for all UIDs
-    let uids = session.uid_search("ALL")?;
+    let uids = session.uid_search("ALL").await?;
 
     // println!("Total messages: {}", uids.len());
     log!("Total messages: {}", uids.len());
@@ -427,7 +520,8 @@ fn fetch_emails_by_uid_batches(
         log!("Fetching UIDs: {}", uid_range);
 
         // Fetch full message body (RFC822) to parse with mailparse
-        let messages = session.uid_fetch(uid_range, "RFC822")?;
+        let messages = session.uid_fetch(uid_range, "RFC822").await?;
+        let messages: Vec<_> = messages.try_collect().await?;
 
         for message in messages.iter() {
             // Get the email body
@@ -569,19 +663,25 @@ fn evaluate_condition(email: &Email, condition: &Condition) -> bool {
 }
 
 /// Execute an action on a specific email
-fn execute_action(
-    session: &mut Session<TlsStream<TcpStream>>,
+async fn execute_action(
+    session: &mut ImapSession,
     email: &Email,
     action: &Action,
-) -> Result<(), imap::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match action.action_type.as_str() {
         "move_to_folder" => {
             if let Some(folder) = &action.folder {
                 // Fix: Wrap the folder name in double quotes for IMAP safety
                 let quoted_folder = format!("\"{}\"", folder);
 
-                session.uid_copy(email.uid.to_string(), &quoted_folder)?;
-                session.uid_store(email.uid.to_string(), "+FLAGS (\\Deleted)")?;
+                session
+                    .uid_copy(email.uid.to_string(), &quoted_folder)
+                    .await?;
+                let _updates: Vec<_> = session
+                    .uid_store(email.uid.to_string(), "+FLAGS (\\Deleted)")
+                    .await?
+                    .try_collect()
+                    .await?;
                 println!("Moved '{}' to folder '{}'", email.subject, folder);
             } else {
                 eprintln!("Move action missing folder");
@@ -589,15 +689,27 @@ fn execute_action(
         }
         "mark_as_read" => {
             // Fix: Use +FLAGS to add the \Seen flag (marking it as read)
-            session.uid_store(email.uid.to_string(), "+FLAGS (\\Seen)")?;
+            let _updates: Vec<_> = session
+                .uid_store(email.uid.to_string(), "+FLAGS (\\Seen)")
+                .await?
+                .try_collect()
+                .await?;
             println!("Marked '{}' as read", email.subject);
         }
         "delete" => {
-            session.uid_store(email.uid.to_string(), "+FLAGS (\\Deleted)")?;
+            let _updates: Vec<_> = session
+                .uid_store(email.uid.to_string(), "+FLAGS (\\Deleted)")
+                .await?
+                .try_collect()
+                .await?;
             println!("Deleted '{}'", email.subject);
         }
         "flag" => {
-            session.uid_store(email.uid.to_string(), "+FLAGS (\\Flagged)")?;
+            let _updates: Vec<_> = session
+                .uid_store(email.uid.to_string(), "+FLAGS (\\Flagged)")
+                .await?
+                .try_collect()
+                .await?;
             println!("Flagged '{}'", email.subject);
         }
         _ => eprintln!("Unknown action type: {}", action.action_type),
@@ -606,13 +718,13 @@ fn execute_action(
 }
 
 /// Process emails through filters and execute actions
-fn process_emails_with_filters(
-    session: &mut Session<TlsStream<TcpStream>>,
+async fn process_emails_with_filters(
+    session: &mut ImapSession,
     emails: &[Email],
-    config: &Config,
-) -> Result<(), Box<dyn std::error::Error>> {
+    email_config: &Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Sort filters by priority (highest first)
-    let mut sorted_filters = config.filters.clone();
+    let mut sorted_filters = email_config.filters.clone();
     sorted_filters.sort_by(|a, b| b.priority.cmp(&a.priority));
 
     for email in emails {
@@ -625,14 +737,14 @@ fn process_emails_with_filters(
             }
 
             if evaluate_condition(email, &filter.condition) {
-                execute_action(session, email, &filter.action)?;
+                execute_action(session, email, &filter.action).await?;
                 break; // Only execute highest priority matching filter
             }
         }
     }
 
     // Expunge deleted emails
-    session.expunge()?;
+    let _expunged: Vec<_> = session.expunge().await?.try_collect().await?;
 
     Ok(())
 }

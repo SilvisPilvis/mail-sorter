@@ -3,19 +3,45 @@ name = "mail-sorter"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies.imap]
-version = "2.4.1"
+# [dependencies.imap]
+# version = "2.4.1"
+
+[dependencies.async-imap]
+version = "0.11"
+default-features = false
+features = ["runtime-tokio"]
+
+[dependencies.tokio]
+version = "1"
+features = ["full"]
+
+[dependencies.dotenvy]
+version = "*"
+
+# [dependencies.tokio-rustls]
+# version = "*"
+
+[dependencies.tokio-native-tls]
+version = "*"
+
+# [dependencies.rustls]
+# version = "*"
 
 [dependencies.native-tls]
 version = "0.2.14"
+
+[dependencies.futures]
+version = "0.3"
+
+# [dependencies.rustls-native-certs]
+# version = "*"
+
 
 [dependencies.chrono]
 version = "*"
 
 [dependencies.base64]
 version = "0.22.1"
-
-
 
 [dependencies.mailparse]
 version = "*"
