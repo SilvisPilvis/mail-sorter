@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use toml;
 
 use async_imap::extensions::idle::IdleResponse;
-use async_imap::{Authenticator, Client, Session};
+use async_imap::{Client, Session};
 use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
 use futures::TryStreamExt;
@@ -66,25 +66,11 @@ struct Email {
     body: String,
 }
 
-struct GmailOAuth2 {
-    user: String,
-    access_token: String,
-}
-
 type ImapSession = Session<TlsStream<TcpStream>>;
 
-impl Authenticator for GmailOAuth2 {
-    type Response = String;
-    fn process(&mut self, _: &[u8]) -> Self::Response {
-        format!(
-            "user={}\x01auth=Bearer {}\x01\x01",
-            self.user, self.access_token
-        )
-    }
-}
-
 async fn connect_and_authenticate(
-    auth: GmailOAuth2,
+    user: &str,
+    password: &str,
 ) -> Result<ImapSession, Box<dyn std::error::Error + Send + Sync>> {
     let domain = "imap.gmail.com";
     let port = 993;
@@ -105,10 +91,7 @@ async fn connect_and_authenticate(
         .into());
     }
 
-    let session = client
-        .authenticate("LOGIN", auth)
-        .await
-        .map_err(|(err, _client)| err)?;
+    let session = client.login(user, password).await.map_err(|e| e.0)?;
 
     Ok(session)
 }
@@ -123,21 +106,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Check if an argument exists to avoid a panic if the user runs it without args
     if args.len() < 2 {
-        eprintln!("Usage: <program> [monitor|filter] (requires GMAIL_USER and GMAIL_ACCESS_TOKEN)");
+        eprintln!("Usage: <program> [monitor|filter] (requires GMAIL_USER and GMAIL_APP_PASSWORD)");
         return Err(
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Incorrect arguments").into(),
         );
     }
 
-    let gmail_auth = GmailOAuth2 {
-        user: std::env::var("GMAIL_USER")?,
-        access_token: std::env::var("GMAIL_ACCESS_TOKEN")?,
-    };
+    let user = std::env::var("GMAIL_USER")?;
+    let password = std::env::var("GMAIL_APP_PASSWORD")?;
 
-    println!("Using user {}", gmail_auth.user);
-    println!("Using access token {}", gmail_auth.access_token);
+    println!("Using user {}", user);
 
-    let mut session = connect_and_authenticate(gmail_auth).await?;
+    let mut session = connect_and_authenticate(&user, &password).await?;
 
     // Load config
     let email_config: Config = toml::from_str(&std::fs::read_to_string(config_path)?)?;
